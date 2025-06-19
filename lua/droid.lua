@@ -53,6 +53,64 @@ M.available_models = {
   "x-ai/grok-3-mini-beta",
 }
 
+--- gets the path to the model persistence file
+--- @return string
+local function get_persistence_file_path()
+  local data_dir = vim.fn.stdpath('data')
+  local droid_dir = data_dir .. '/droid'
+  return droid_dir .. '/model.json'
+end
+
+--- saves the current model to persistence file
+--- @param model string
+--- @return boolean success
+local function save_persisted_model(model)
+  local file_path = get_persistence_file_path()
+  local dir_path = vim.fn.fnamemodify(file_path, ':h')
+
+  -- ensure directory exists
+  if vim.fn.isdirectory(dir_path) == 0 then
+    vim.fn.mkdir(dir_path, 'p')
+  end
+
+  local data = { current_model = model }
+  local json_str = vim.json.encode(data)
+
+  local file = io.open(file_path, 'w')
+  if not file then
+    return false
+  end
+
+  file:write(json_str)
+  file:close()
+  return true
+end
+
+--- loads the persisted model from file
+--- @return string? model name if found
+local function load_persisted_model()
+  local file_path = get_persistence_file_path()
+  local file = io.open(file_path, 'r')
+
+  if not file then
+    return nil
+  end
+
+  local content = file:read('*all')
+  file:close()
+
+  if not content or content == '' then
+    return nil
+  end
+
+  local ok, data = pcall(vim.json.decode, content)
+  if not ok or not data or not data.current_model then
+    return nil
+  end
+
+  return data.current_model
+end
+
 --- setup function to initialize the plugin
 --- @param opts CompletionOpts?
 function M.setup(opts)
@@ -73,7 +131,13 @@ function M.setup(opts)
     error("api_key_name must be provided in droid.setup()")
   end
 
-  config.current_model = config.default_model
+  -- load persisted model if available, otherwise use default
+  local persisted_model = load_persisted_model()
+  if persisted_model and vim.tbl_contains(config.available_models, persisted_model) then
+    config.current_model = persisted_model
+  else
+    config.current_model = config.default_model
+  end
 end
 
 --- @return string
@@ -85,6 +149,9 @@ end
 function M.set_current_model(model)
   if vim.tbl_contains(config.available_models, model) then
     config.current_model = model
+    if not save_persisted_model(model) then
+      notify("droid: model set but failed to persist", vim.log.levels.WARN)
+    end
     notify("droid: using " .. model, vim.log.levels.INFO)
   else
     notify("droid: invalid model " .. model, vim.log.levels.ERROR)
