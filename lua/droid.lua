@@ -64,7 +64,7 @@ function M.setup(opts)
     "you are a helpful assistant. you're working with me in neovim. i'll send you contents of the buffer(s) im working in along with notes, questions or comments. you are very curt, yet helpful and a bit sarcastic.",
     default_model = M.available_models[1],
     available_models = M.available_models,
-    api_key_name = nil, -- must be provided
+    api_key_name = "OPENROUTER_API_KEY", -- must be provided
   }
 
   config = vim.tbl_deep_extend("force", defaults, opts or {})
