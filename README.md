@@ -112,6 +112,10 @@ use `create_droid_buffer()` to start dedicated llm conversations. these buffers 
 - curl (for api requests)
 - api key from openrouter or compatible service
 
+## acknowledgements
+
+the original version of this was modified from @yacineMTB's [dingllm.nvim](https://github.com/yacineMTB/dingllm.nvim)
+
 ## license
 
 [apache](LICENSE)
