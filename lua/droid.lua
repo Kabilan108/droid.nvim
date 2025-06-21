@@ -730,6 +730,7 @@ end
 --- @field prompt string
 --- @field context string
 --- @field debug string
+--- @field error string?
 --- @field refs ContextRef[
 
 --- @param prompt string
@@ -743,17 +744,22 @@ function util.build_prompt(prompt)
 
     if rref.error then
       refs[i] = { type = "error", error = rref.error, raw = rref.ref.raw }
-      table.insert(error_l, string.format("[droid] failed to parse '%s': %s", rref.ref.raw, rref.error))
+      table.insert(error_l, string.format("droid: failed to parse '%s': %s", rref.ref.raw, rref.error))
     else
       table.insert(debug_l, rref.ref.raw)
       table.insert(context_l, rref.content)
     end
   end
 
+  local debug = ""
+  if #debug_l > 0 then
+    debug = string.format("[references]: %s\n", table.concat(debug_l, ", "))
+  end
   return {
     prompt = prompt,
     context = table.concat(context_l, "\n"),
-    debug = string.format("[droid] parsed %s\n%s\n", table.concat(debug_l, ", "), table.concat(error_l, "\n")),
+    debug = debug,
+    error = table.concat(error_l, "\n"),
     refs = refs
   }
 end
@@ -858,6 +864,11 @@ function util.parse_conversation(lines)
     local begin_model = line:match(assistant_begin_pattern)
     local end_model = line:match(assistant_end_pattern)
 
+    -- skip debug lines that start with [droid] references:
+    if line:match("^%[references%]:") then
+      goto continue
+    end
+
     if begin_model then
       -- store pending user message
       if #current_content > 0 then
@@ -897,6 +908,8 @@ function util.parse_conversation(lines)
     else
       table.insert(current_content, line)
     end
+
+    ::continue::
   end
 
   -- hanlde remaining content
@@ -1103,12 +1116,20 @@ function util.invoke_llm_and_stream_into_editor(mode)
 
   -- process context references in all messages
   local processed_messages = {}
+  local debug_info = ""
 
   if messages then
-    for _, message in ipairs(messages) do
+    for i, message in ipairs(messages) do
       local content = ""
       if message.role == "user" then
         local prompt = util.build_prompt(message.content)
+        if prompt.error then
+          notify("droid: " .. prompt.error, vim.log.levels.DEBUG)
+        end
+        -- capture debug info from the last user message only
+        if i == #messages then
+          debug_info = prompt.debug
+        end
         content = format_prompt_for_api(prompt)
       else
         content = message.content
@@ -1129,7 +1150,7 @@ function util.invoke_llm_and_stream_into_editor(mode)
   -- track assistant markers and usage stats
   local first_output = true
   local usage_stats_ref = {}
-  local marker_prefix = "\n\n=== ASSISTANT BEGIN [" .. config.current_model .. "] ===\n"
+  local marker_prefix = "\n\n" .. debug_info .. "=== ASSISTANT BEGIN [" .. config.current_model .. "] ===\n"
 
   -- parse server-sent events (sse) format: "event: type\ndata: json"
   local function parse_and_call(line)
