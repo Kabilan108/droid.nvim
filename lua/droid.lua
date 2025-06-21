@@ -1,4 +1,4 @@
---- @diagnostic disable: deprecated
+k --- @diagnostic disable: deprecated
 -- based on yacineMTB/dingllm.nvim
 
 local Job = require "plenary.job"
@@ -23,6 +23,9 @@ local notify = mini_notify.make_notify({
 --       the record would be updaetd every time a new generation is made to account for
 --       changes in the prompts.
 
+-- TODO: modify prompts to tell models what tags are available
+-- TODO: workshop better nomencalture for context providers/references
+
 -- modules
 local M = {}
 local util = {}
@@ -34,7 +37,11 @@ local group = vim.api.nvim_create_augroup('Droid_AutoGroup', { clear = true })
 local droid_buffer_counter = 0
 local droid_buffers = {} -- track active droid buffers
 
---- @type table<string, fun(args: string): string, string>
+--- @class ContextProvider
+--- @field handler fun(args: ...): string|nil, string|nil
+--- @field type "cmd" | "file" | "range"
+
+--- @type table<string, ContextProvider>
 local context_providers = {}
 
 -- >>>public api
@@ -366,12 +373,13 @@ end
 
 --- registers a custom context provider
 --- @param name string the provider name (used in @name:args syntax)
+--- @param type "cmd" | "file" | "range"
 --- @param handler fun(args: string): string, string function that takes args and returns content, error
-function M.register_context_provider(name, handler)
+function M.register_context_provider(name, type, handler)
   if type(name) ~= "string" or type(handler) ~= "function" then
     error("register_context_provider requires string name and function handler")
   end
-  context_providers[name] = handler
+  context_providers[name] = { type = type, handler = handler }
   notify("droid: registered context provider '" .. name .. "'", vim.log.levels.INFO)
 end
 
@@ -449,16 +457,16 @@ end
 function util.resolve_file_path(path)
   -- handle absolute paths
   if path:match("^/") then
-    if vim.fn.filereadable(path) == 1 or vim.fn.isdirectory(path) == 1 then
+    if vim.fn.filereadable(path) == 1 then
       return path, nil
     else
-      return nil, "file or directory not found: " .. path
+      return nil, "file not found: " .. path
     end
   end
 
   -- try relative to current working directory first
   local cwd_path = vim.fn.getcwd() .. "/" .. path
-  if vim.fn.filereadable(cwd_path) == 1 or vim.fn.isdirectory(cwd_path) == 1 then
+  if vim.fn.filereadable(cwd_path) == 1 then
     return cwd_path, nil
   end
 
@@ -466,181 +474,273 @@ function util.resolve_file_path(path)
   local git_root = vim.fn.system("git rev-parse --show-toplevel 2>/dev/null"):gsub("\n$", "")
   if vim.v.shell_error == 0 and git_root ~= "" then
     local git_path = git_root .. "/" .. path
-    if vim.fn.filereadable(git_path) == 1 or vim.fn.isdirectory(git_path) == 1 then
+    if vim.fn.filereadable(git_path) == 1 then
       return git_path, nil
     end
   end
 
-  return nil, "file or directory not found: " .. path
+  return nil, "file not found: " .. path
 end
 
 -- >>>context injection
 
---- @class ContextReference
---- @field reference string the complete @reference match (e.g., "@filename", "@file:1:10")
+--- @class Ref
+--- @field type "file" | "shell" | "ctx_provider" | "error"
+--- @field error? string
+--- @field raw string
+
+--- @class PathRef : Ref
+--- @field type "file"
+--- @field path string
+--- @field start_line? number
+--- @field end_line? number
+
+--- @class ShellRef : Ref
+--- @field type "shell"
+--- @field command string
+
+--- @class CustomRef : Ref
+--- @field type "ctx_provider"
+--- @field name string
+--- @field path? string
+--- @field start_line? number
+--- @field end_line? number
+
+--- @alias ContextRef PathRef | ShellRef | CustomRef | Ref
+
+--- @param text string
+--- @return CustomRef[]
+local function parse_custom_refs(text)
+  local refs = {}
+
+  for candidate in text:gmatch("#([%w_%-]+[^%s]*)") do
+    local refname, file, start_ln, end_ln = candidate:match("^([%w_%-]+):([^:]+):(%d+):([%d%+%-]+)$")
+    if not refname then
+      refname, file = candidate:match("^([%w_%-]+):(.+)$")
+    end
+    if not refname then
+      refname = candidate:match("^([%w_%-]+)$")
+    end
+
+    if refname then
+      if context_providers[refname] then
+        local parsed_ref = {
+          type = "ctx_provider",
+          name = refname,
+          raw = "#" .. candidate,
+        }
+
+        if file then
+          parsed_ref.path = file
+          if start_ln then
+            parsed_ref.start_line = tonumber(start_ln)
+            parsed_ref.end_line = tonumber(end_ln)
+          end
+        end
+
+        table.insert(refs, parsed_ref)
+      else
+        table.insert(refs, {
+          type = "error",
+          error = "unknown provider: " .. refname,
+          raw = "#" .. candidate,
+        })
+      end
+    end
+  end
+
+  return refs
+end
+
+--- parse path references from text (e.g. @path/to/file.txt, @file.txt:1:10)
+--- @param text string
+--- @return PathRef[]
+local function parse_path_refs(text)
+  local refs = {}
+
+  for candidate in text:gmatch("@([%w%.%/%:_%-]+)") do
+    local parsed_ref = nil
+
+    -- check for file with line range: @path:start:end
+    if candidate:match("^[^:]+:%d+:[%d%+-]+$") then
+      local path, start_ln, end_ln = candidate:match("^([^:]+):(%d+):([%d%+-]+)$")
+      if path and start_ln and end_ln then
+        parsed_ref = {
+          type = "file",
+          path = path,
+          start_line = tonumber(start_ln),
+          end_line = tonumber(end_ln),
+          raw = "@" .. candidate,
+        }
+      end
+    end
+
+    if not parsed_ref then
+      if candidate:match(":") then
+        -- malformed reference
+        parsed_ref = { type = "error", error = "malformed reference", raw = "@" .. candidate }
+      else
+        -- default to @file
+        parsed_ref = { type = "file", path = candidate, raw = "@" .. candidate }
+      end
+    end
+
+    table.insert(refs, parsed_ref)
+  end
+
+  return refs
+end
+
+--- parse shell commands from text (e.g. @!`ls -la`)
+--- @param text string
+--- @return ShellRef[]
+local function parse_shell_refs(text)
+  local refs = {}
+  for cmd in text:gmatch("@!`([^`]+)`") do
+    table.insert(refs, { type = "shell", command = cmd, raw = "@!`" .. cmd .. "`" })
+  end
+  return refs
+end
 
 --- parses context references from text, extracting all @reference patterns
 --- @param text string the text to parse for context references
---- @return ContextReference[] array of context reference objects
+--- @return ContextRef[]
 function util.parse_context_references(text)
-  local references = {}
-
-  -- pattern to match @references (handles various syntaxes)
-  -- supports: @filename, @dir/, @file:10:20, @def:symbol, @!`cmd args`
-  local patterns = {
-    -- @!`cmd args` (backtick syntax for shell commands)
-    "(@!`[^`]+`)",
-    -- @command:args (colon syntax for LSP and other commands)
-    "(@%w+:[^%s]+)",
-    -- @path/file:line:range (file with line ranges)
-    "(@[^%s:]+:%d+[:%d%-+]*)",
-    -- @file or @dir/ (simple file/directory references, excluding @! which needs backticks)
-    "(@[^%s:`!]+/?)"
-  }
-
-  for _, pattern in ipairs(patterns) do
-    for match in text:gmatch(pattern) do
-      table.insert(references, {
-        reference = match
-      })
+  local refs = {}
+  local parsers = { parse_path_refs, parse_shell_refs, parse_custom_refs }
+  for _, parser in ipairs(parsers) do
+    for _, ref in ipairs(parser(text)) do
+      table.insert(refs, ref)
     end
   end
-
-  return references
+  return refs
 end
 
---- resolves a single context reference and returns formatted content
---- @param reference string the reference to resolve (e.g., "@filename", "@def:symbol", "@!`ls -la`")
---- @return string? resolved content
---- @return string? error message if resolution fails
-function util.resolve_context_reference(reference)
-  -- remove @ prefix for processing
-  local ref_content = reference:sub(2)
-
-  -- handle shell command syntax: @!`cmd args`
-  local shell_cmd = ref_content:match("^!`(.+)`$")
-  if shell_cmd then
-    -- execute shell command and capture output
-    local output = vim.fn.system(shell_cmd)
-    local exit_code = vim.v.shell_error
-
-    if exit_code ~= 0 then
-      return nil, string.format("shell command failed (exit code %d): %s", exit_code, shell_cmd)
+--- @param ref ContextRef
+--- @param content string
+--- @return string
+local function format_reference(ref, content)
+  local tmpl = '<reference match="%s"'
+  local args = { ref.raw }
+  if ref.type == "file" or ref.type == "ctx_provider" then
+    if ref.type == "ctx_provider" then
+      tmpl = tmpl .. (' provider="%s"')
+      table.insert(args, ref.name)
     end
-
-    -- remove trailing newline if present
-    output = output:gsub("\n$", "")
-
-    return string.format("--- SHELL: %s ---\n%s\n--- END SHELL ---", shell_cmd, output), nil
+    if ref.path then
+      tmpl = tmpl .. (' path="%s"')
+      table.insert(args, ref.path)
+    end
+    if ref.start_line and ref.end_line then
+      tmpl = tmpl .. (' start_line="%s" end_line="%s"')
+      table.insert(args, ref.start_line)
+      table.insert(args, ref.end_line)
+    end
+    tmpl = tmpl .. ">\n%s\n</reference>"
+    table.insert(args, content)
+  elseif ref.type == "shell" then
+    tmpl = tmpl .. (' shell_command="%s">\n%s\n</reference>')
+    table.insert(args, ref.command)
+    table.insert(args, content)
   end
 
-  -- handle custom context providers and LSP commands: @def:symbol, @func:name, @ref:symbol, @diagnostics
-  local provider_name, provider_arg = ref_content:match("^(%w+):(.+)$")
-  if provider_name then
-    -- check if we have a custom provider for this
-    if context_providers[provider_name] then
-      local content, err = context_providers[provider_name](provider_arg)
-      if content then
-        return string.format("--- %s: %s ---\n%s\n--- END %s ---",
-          provider_name:upper(), provider_arg, content, provider_name:upper()), nil
-      else
-        return nil, err or ("provider " .. provider_name .. " failed")
-      end
-    end
+  return string.format(tmpl, unpack(args))
+end
 
-    -- handle built-in LSP commands
-    if provider_name == "def" or provider_name == "func" or provider_name == "ref" then
-      return nil, "LSP integration not yet implemented"
-    elseif provider_name == "diagnostics" then
-      return nil, "diagnostics integration not yet implemented"
-    else
-      return nil, "unknown context provider: " .. provider_name
-    end
-  end
-
-  -- handle git commands: @diff, @tree
-  if ref_content == "diff" then
-    return nil, "git diff integration not yet implemented"
-  elseif ref_content == "tree" then
-    return nil, "git tree integration not yet implemented"
-  end
-
-  -- handle file references with optional line ranges
-  local file_path, line_start, line_end = ref_content:match("^([^:]+):(%d+):(.+)$")
-  if file_path then
-    local resolved_path, err = util.resolve_file_path(file_path)
-    if not resolved_path then
-      return nil, err
-    end
-
-    -- parse line range
-    local start_num = tonumber(line_start)
-    local end_num = nil
-
-    if line_end == "-1" then
-      end_num = -1 -- end of file
-    elseif line_end:match("^%+(%d+)$") then
-      local offset = tonumber(line_end:match("^%+(%d+)$"))
-      end_num = start_num + offset - 1
-    elseif line_end:match("^%-(%d+)$") then
-      -- negative line number from end
-      return nil, "negative line numbers not yet implemented"
-    else
-      end_num = tonumber(line_end)
-    end
-
-    if not start_num or not end_num then
-      return nil, "invalid line range format"
-    end
-
-    -- read file content with line range
-    local lines = {}
-    local file = io.open(resolved_path, 'r')
-    if not file then
-      return nil, "cannot read file: " .. resolved_path
-    end
-
-    local line_num = 1
-    for line in file:lines() do
-      if line_num >= start_num and (end_num == -1 or line_num <= end_num) then
-        table.insert(lines, line)
-      elseif line_num > end_num and end_num ~= -1 then
-        break
-      end
-      line_num = line_num + 1
-    end
-    file:close()
-
-    local content = table.concat(lines, '\n')
-    return string.format("--- FILE: %s (%d-%s) ---\n%s\n--- END FILE ---",
-      file_path, start_num, end_num == -1 and "EOF" or tostring(end_num), content), nil
-  end
-
-  -- handle simple file/directory references
-  local resolved_path, err = util.resolve_file_path(ref_content)
-  if not resolved_path then
-    return nil, err
-  end
-
-  -- check if it's a directory (ends with / or is actually a directory)
-  if ref_content:match("/$") or vim.fn.isdirectory(resolved_path) == 1 then
-    return nil, "directory listing not yet implemented"
-  end
-
-  -- read entire file
-  local file = io.open(resolved_path, 'r')
+--- read a file and return its content
+--- @param path string
+--- @param start_line number?
+--- @param end_line number?
+--- @return string|nil content
+--- @return string|nil error message if resolution fails
+function util.read_file(path, start_line, end_line)
+  local file = io.open(path, 'r')
   if not file then
-    return nil, "cannot read file: " .. resolved_path
+    return nil, "could not open file: " .. path
   end
 
   local content = file:read('*all')
   file:close()
 
   if not content then
-    return nil, "file is empty or unreadable: " .. resolved_path
+    return nil, "file is empty or unreadable: " .. path
   end
 
-  return string.format("--- FILE: %s ---\n%s\n--- END FILE ---", ref_content, content), nil
+  if start_line and end_line then
+    local lines = vim.split(content, '\n')
+    local start_idx = math.max(1, start_line)
+    local end_idx
+
+    if end_line < 0 then
+      -- negative: from end (-1 = last line, -2 = second to last, etc.)
+      end_idx = #lines + end_line + 1
+    elseif end_line < start_line then
+      -- smaller than start: treat as offset from start
+      end_idx = start_line + end_line
+    else
+      -- normal case: absolute line number
+      end_idx = end_line
+    end
+
+    end_idx = math.min(#lines, math.max(start_idx, end_idx))
+    content = table.concat(vim.list_slice(lines, start_idx, end_idx), '\n')
+  end
+
+  return content, nil
+end
+
+--- resolves a single context reference and returns formatted content
+--- @param ref ContextRef
+--- @return string|nil content
+--- @return string|nil error message if resolution fails
+function util.resolve_context_reference(ref)
+  if ref.type == "error" then
+    return nil, ref.error
+  end
+
+  if ref.type == "shell" then
+    local output = vim.fn.system(ref.command)
+    if vim.v.shell_error ~= 0 then
+      return nil, "shell command failed: " .. ref.command .. "\n" .. output
+    end
+    return format_reference(ref, output), nil
+  end
+
+  if ref.type == "ctx_provider" then
+    local p = context_providers[ref.name]
+    if not p then
+      return nil, "unknown context provider: " .. ref.name
+    end
+
+    local ok, out, err
+    if p.type == "cmd" then
+      ok, out, err = pcall(p.handler)
+    elseif p.type == "file" then
+      ok, out, err = pcall(p.handler, ref.path)
+    elseif p.type == "range" then
+      ok, out, err = pcall(p.handler, ref.path, ref.start_line, ref.end_line)
+    end
+    if not ok or not out or err then
+      return nil, "context provider failed: " .. err
+    end
+
+    return format_reference(ref, out), nil
+  end
+
+  if ref.type == "file" then
+    local resolved_path, content, err
+    resolved_path, err = util.resolve_file_path(ref.path)
+    if not resolved_path or err then
+      return nil, err
+    end
+    content, err = util.read_file(resolved_path, ref.start_line, ref.end_line)
+    if not content or err then
+      return nil, err
+    end
+    return format_reference(ref, content), nil
+  end
+
+  return nil, "unknown reference type: " .. ref.type
 end
 
 --- processes a message content string and resolves all context references
@@ -655,14 +755,14 @@ function util.process_context_references(content)
   -- process references in reverse order to maintain string positions
   for i = #references, 1, -1 do
     local ref = references[i]
-    local resolved_content, err = util.resolve_context_reference(ref.reference)
+    local resolved_content, err = util.resolve_context_reference(ref)
 
     if resolved_content then
       -- replace the reference with resolved content
-      processed_content = processed_content:gsub(vim.pesc(ref.reference), resolved_content, 1)
+      processed_content = processed_content:gsub(vim.pesc(ref.raw), resolved_content, 1)
     else
       -- collect error for reporting
-      table.insert(errors, string.format("Failed to resolve %s: %s", ref.reference, err or "unknown error"))
+      table.insert(errors, string.format("Failed to resolve %s: %s", ref.raw, err or "unknown error"))
     end
   end
 
