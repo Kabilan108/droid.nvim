@@ -1,5 +1,4 @@
-k --- @diagnostic disable: deprecated
--- based on yacineMTB/dingllm.nvim
+--- @diagnostic disable: deprecated
 
 local Job = require "plenary.job"
 local pickers = require "telescope.pickers"
@@ -25,10 +24,12 @@ local notify = mini_notify.make_notify({
 
 -- TODO: modify prompts to tell models what tags are available
 -- TODO: workshop better nomencalture for context providers/references
+-- TODO: command/path parsing might have issues with spaces in paths and escaped `
 
 -- modules
 local M = {}
 local util = {}
+M.util = util
 
 -- state
 local config = {}
@@ -37,11 +38,7 @@ local group = vim.api.nvim_create_augroup('Droid_AutoGroup', { clear = true })
 local droid_buffer_counter = 0
 local droid_buffers = {} -- track active droid buffers
 
---- @class ContextProvider
---- @field handler fun(args: ...): string|nil, string|nil
---- @field type "cmd" | "file" | "range"
-
---- @type table<string, ContextProvider>
+--- @type table<string, fun(ref: CustomRef): string?, string?>
 local context_providers = {}
 
 -- >>>public api
@@ -63,12 +60,14 @@ M.available_models = {
 --- @field help_prompt string?
 --- @field default_model string?
 --- @field available_models string[]?
+--- @field enable_helicone boolean?
 
 --- setup function to initialize the plugin
 --- @param opts Droid.Opts?
 function M.setup(opts)
   local defaults = {
-    base_url = "https://openrouter.ai/api/v1",
+    -- base_url = "https://openrouter.ai/api/v1",
+    base_url = "https://openrouter.helicone.ai/api/v1",
     edit_prompt =
     "You should replace the code that you are sent, only following the comments. Do not talk at all. Only output valid code. Do not provide any backticks that surround the code. Never ever output backticks like this ```. Any comment that is asking you for something should be removed after you satisfy them. Other comments should left alone. Do not output backticks",
     help_prompt =
@@ -76,6 +75,7 @@ function M.setup(opts)
     default_model = M.available_models[1],
     available_models = M.available_models,
     api_key_name = "OPENROUTER_API_KEY", -- must be provided
+    enable_helicone = true,
   }
 
   config = vim.tbl_deep_extend("force", defaults, opts or {})
@@ -168,7 +168,7 @@ function M.select_model()
         width = 60,
       }
     },
-    attach_mappings = function(prompt_bufnr, map)
+    attach_mappings = function(prompt_bufnr, _)
       actions.select_default:replace(function()
         actions.close(prompt_bufnr)
         local selection = action_state.get_selected_entry()
@@ -324,7 +324,7 @@ function M.pick_droid_buffer()
     sorter = conf.generic_sorter({}),
     previewer = previewers.new_buffer_previewer({
       title = "Chat Preview",
-      define_preview = function(self, entry, status)
+      define_preview = function(self, entry, _)
         -- preview the buffer content
         if entry.buffer and vim.api.nvim_buf_is_valid(entry.buffer) then
           local lines = vim.api.nvim_buf_get_lines(entry.buffer, 0, -1, false)
@@ -373,14 +373,12 @@ end
 
 --- registers a custom context provider
 --- @param name string the provider name (used in @name:args syntax)
---- @param type "cmd" | "file" | "range"
---- @param handler fun(args: string): string, string function that takes args and returns content, error
-function M.register_context_provider(name, type, handler)
+--- @param handler fun(args: CustomRef): string?, string?
+function M.register_context_provider(name, handler)
   if type(name) ~= "string" or type(handler) ~= "function" then
     error("register_context_provider requires string name and function handler")
   end
-  context_providers[name] = { type = type, handler = handler }
-  notify("droid: registered context provider '" .. name .. "'", vim.log.levels.INFO)
+  context_providers[name] = handler
 end
 
 -- >>>utilities
@@ -441,13 +439,6 @@ function util.load_persisted_model()
   end
 
   return data.current_model
-end
-
---- retrieves an api key from environment variables
---- @param name string
---- @return string?
-function util.get_api_key(name)
-  return os.getenv(name)
 end
 
 --- utility function to resolve file paths relative to git root or cwd
@@ -542,7 +533,7 @@ local function parse_custom_refs(text)
       else
         table.insert(refs, {
           type = "error",
-          error = "unknown provider: " .. refname,
+          error = "unknown context provider " .. refname,
           raw = "#" .. candidate,
         })
       end
@@ -674,9 +665,6 @@ function util.read_file(path, start_line, end_line)
     if end_line < 0 then
       -- negative: from end (-1 = last line, -2 = second to last, etc.)
       end_idx = #lines + end_line + 1
-    elseif end_line < start_line then
-      -- smaller than start: treat as offset from start
-      end_idx = start_line + end_line
     else
       -- normal case: absolute line number
       end_idx = end_line
@@ -689,84 +677,94 @@ function util.read_file(path, start_line, end_line)
   return content, nil
 end
 
+--- @class ResolvedRef
+--- @field ref ContextRef
+--- @field content? string
+--- @field error? string
+
 --- resolves a single context reference and returns formatted content
 --- @param ref ContextRef
---- @return string|nil content
---- @return string|nil error message if resolution fails
+--- @return ResolvedRef resolved
 function util.resolve_context_reference(ref)
   if ref.type == "error" then
-    return nil, ref.error
+    return { ref = ref, error = ref.error }
   end
 
   if ref.type == "shell" then
     local output = vim.fn.system(ref.command)
     if vim.v.shell_error ~= 0 then
-      return nil, "shell command failed: " .. ref.command .. "\n" .. output
+      return { ref = ref, error = "shell command failed: " .. ref.command .. "\n" .. output }
     end
-    return format_reference(ref, output), nil
+    return { ref = ref, content = format_reference(ref, output) }
   end
 
   if ref.type == "ctx_provider" then
     local p = context_providers[ref.name]
     if not p then
-      return nil, "unknown context provider: " .. ref.name
+      return { ref = ref, error = "unknown context provider: " .. ref.name }
     end
-
-    local ok, out, err
-    if p.type == "cmd" then
-      ok, out, err = pcall(p.handler)
-    elseif p.type == "file" then
-      ok, out, err = pcall(p.handler, ref.path)
-    elseif p.type == "range" then
-      ok, out, err = pcall(p.handler, ref.path, ref.start_line, ref.end_line)
-    end
+    local ok, out, err = pcall(p, ref)
     if not ok or not out or err then
-      return nil, "context provider failed: " .. err
+      return { ref = ref, error = "context provider failed: " .. err }
     end
-
-    return format_reference(ref, out), nil
+    return { ref = ref, content = format_reference(ref, out) }
   end
 
   if ref.type == "file" then
     local resolved_path, content, err
     resolved_path, err = util.resolve_file_path(ref.path)
     if not resolved_path or err then
-      return nil, err
+      return { ref = ref, error = err }
     end
     content, err = util.read_file(resolved_path, ref.start_line, ref.end_line)
     if not content or err then
-      return nil, err
+      return { ref = ref, error = err }
     end
-    return format_reference(ref, content), nil
+    return { ref = ref, content = format_reference(ref, content) }
   end
 
-  return nil, "unknown reference type: " .. ref.type
+  return { ref = ref, error = "unknown reference type: " .. ref.type }
 end
 
---- processes a message content string and resolves all context references
---- @param content string the message content to process
---- @return string processed content with resolved references
---- @return string[] array of any error messages encountered
-function util.process_context_references(content)
-  local references = util.parse_context_references(content)
-  local processed_content = content
-  local errors = {}
+--- @class PromptContext
+--- @field prompt string
+--- @field context string
+--- @field debug string
+--- @field refs ContextRef[
 
-  -- process references in reverse order to maintain string positions
-  for i = #references, 1, -1 do
-    local ref = references[i]
-    local resolved_content, err = util.resolve_context_reference(ref)
+--- @param prompt string
+--- @return PromptContext
+function util.build_prompt(prompt)
+  local refs = util.parse_context_references(prompt)
+  local context_l, debug_l, error_l = {}, {}, {}
 
-    if resolved_content then
-      -- replace the reference with resolved content
-      processed_content = processed_content:gsub(vim.pesc(ref.raw), resolved_content, 1)
+  for i = 1, #refs, 1 do
+    local rref = util.resolve_context_reference(refs[i])
+
+    if rref.error then
+      refs[i] = { type = "error", error = rref.error, raw = rref.ref.raw }
+      table.insert(error_l, string.format("[droid] failed to parse '%s': %s", rref.ref.raw, rref.error))
     else
-      -- collect error for reporting
-      table.insert(errors, string.format("Failed to resolve %s: %s", ref.raw, err or "unknown error"))
+      table.insert(debug_l, rref.ref.raw)
+      table.insert(context_l, rref.content)
     end
   end
 
-  return processed_content, errors
+  return {
+    prompt = prompt,
+    context = table.concat(context_l, "\n"),
+    debug = string.format("[droid] parsed %s\n%s\n", table.concat(debug_l, ", "), table.concat(error_l, "\n")),
+    refs = refs
+  }
+end
+
+---@param pc PromptContext
+---@return string
+local function format_prompt_for_api(pc)
+  if pc.context == "" then
+    return pc.prompt
+  end
+  return string.format("%s\n\n<context>\n%s\n</context>", pc.prompt, pc.context)
 end
 
 -- >>>completions
@@ -975,7 +973,7 @@ end
 --- @return string[] Array curl command arguments
 function util.make_anthropic_spec_curl_args(mode, prompt)
   local base_url = config.base_url .. "/chat/completions"
-  local api_key = config.api_key_name and util.get_api_key(config.api_key_name)
+  local api_key = config.api_key_name and os.getenv(config.api_key_name)
   local data = {
     system = mode == "edit" and config.edit_prompt or config.help_prompt,
     messages = { { role = 'user', content = prompt } },
@@ -1000,7 +998,7 @@ end
 --- @return string[] Array curl command arguments
 function util.make_openai_spec_curl_args(mode, messages)
   local base_url = config.base_url .. "/chat/completions"
-  local api_key = config.api_key_name and util.get_api_key(config.api_key_name)
+  local api_key = config.api_key_name and os.getenv(config.api_key_name) or ''
 
   local convhist = {
     { role = 'system', content = mode == "edit" and config.edit_prompt or config.help_prompt }
@@ -1017,11 +1015,20 @@ function util.make_openai_spec_curl_args(mode, messages)
     stream = true,
   }
 
-  local args = { '-N', '-X', 'POST', '-H', 'Content-Type: application/json', '-d', vim.json.encode(data) }
+  local args = {
+    '-N', '-X', 'POST', '-H', 'Content-Type: application/json', '-d', vim.json.encode(data)
+  }
+
   if api_key then
     table.insert(args, '-H')
     table.insert(args, 'Authorization: Bearer ' .. api_key)
   end
+
+  if config.enable_helicone then
+    table.insert(args, '-H')
+    table.insert(args, 'Helicone-Auth: Bearer ' .. (os.getenv('HELICONE_API_KEY') or ''))
+  end
+
   table.insert(args, base_url)
   return args
 end
@@ -1096,30 +1103,23 @@ function util.invoke_llm_and_stream_into_editor(mode)
 
   -- process context references in all messages
   local processed_messages = {}
-  local all_errors = {}
 
   if messages then
     for _, message in ipairs(messages) do
-      local processed_content, errors = util.process_context_references(message.content)
-
-      -- collect any errors from context resolution
-      for _, error_msg in ipairs(errors) do
-        table.insert(all_errors, error_msg)
+      local content = ""
+      if message.role == "user" then
+        local prompt = util.build_prompt(message.content)
+        content = format_prompt_for_api(prompt)
+      else
+        content = message.content
       end
 
       -- add processed message
       table.insert(processed_messages, {
         role = message.role,
-        content = processed_content,
+        content = content,
         model = message.model
       })
-    end
-  end
-
-  -- notify user of any context resolution errors
-  if #all_errors > 0 then
-    for _, error_msg in ipairs(all_errors) do
-      notify("droid: " .. error_msg, vim.log.levels.WARN)
     end
   end
 
