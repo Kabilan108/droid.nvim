@@ -865,51 +865,47 @@ function util.parse_conversation(lines)
     local end_model = line:match(assistant_end_pattern)
 
     -- skip debug lines that start with [droid] references:
-    if line:match("^%[references%]:") then
-      goto continue
-    end
-
-    if begin_model then
-      -- store pending user message
-      if #current_content > 0 then
-        local content = table.concat(current_content, '\n'):gsub("^%s*(.-)%s*$", "%1")
-        if content ~= "" then
-          table.insert(messages, { role = "user", content = content })
-          last_was_assistant = false
+    if not line:match("^%[references%]:") then
+      if begin_model then
+        -- store pending user message
+        if #current_content > 0 then
+          local content = table.concat(current_content, '\n'):gsub("^%s*(.-)%s*$", "%1")
+          if content ~= "" then
+            table.insert(messages, { role = "user", content = content })
+            last_was_assistant = false
+          end
+          current_content = {}
         end
+
+        in_assistant_block = true
+        assistant_model = begin_model
+      elseif end_model then
+        -- extract just the model name from end marker (ignore usage stats)
+        local end_model_name = end_model:match("^([^|]+)") or end_model
+        end_model_name = end_model_name:gsub("%s+$", "") -- trim trailing spaces
+
+        if not in_assistant_block or end_model_name ~= assistant_model then
+          return nil, "malformed conversation: mismatched assistant markers at line " .. i
+        end
+
+        -- store assistant message
+        local content = table.concat(current_content, '\n'):gsub("^%s*(.-)%s*$", "%1")
+        if content == "" and last_was_assistant then
+          return nil, "malformed conversation: consecutive assistant messages without user input"
+        end
+
+        table.insert(messages, {
+          role = "assistant", content = content, model = assistant_model
+        })
+
+        in_assistant_block = false
+        assistant_model = nil
         current_content = {}
+        last_was_assistant = true
+      else
+        table.insert(current_content, line)
       end
-
-      in_assistant_block = true
-      assistant_model = begin_model
-    elseif end_model then
-      -- extract just the model name from end marker (ignore usage stats)
-      local end_model_name = end_model:match("^([^|]+)") or end_model
-      end_model_name = end_model_name:gsub("%s+$", "") -- trim trailing spaces
-
-      if not in_assistant_block or end_model_name ~= assistant_model then
-        return nil, "malformed conversation: mismatched assistant markers at line " .. i
-      end
-
-      -- store assistant message
-      local content = table.concat(current_content, '\n'):gsub("^%s*(.-)%s*$", "%1")
-      if content == "" and last_was_assistant then
-        return nil, "malformed conversation: consecutive assistant messages without user input"
-      end
-
-      table.insert(messages, {
-        role = "assistant", content = content, model = assistant_model
-      })
-
-      in_assistant_block = false
-      assistant_model = nil
-      current_content = {}
-      last_was_assistant = true
-    else
-      table.insert(current_content, line)
     end
-
-    ::continue::
   end
 
   -- hanlde remaining content
