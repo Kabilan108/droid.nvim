@@ -34,11 +34,11 @@ This document outlines the implementation plan for adding context injection feat
 - ✅ `#provider_name` - Use registered custom context providers
 - ✅ `#provider_name:path` - Provider with path argument
 - ✅ `#provider_name:path:10:20` - Provider with path and line range
+- ✅ `#diagnostics` - Include LSP diagnostics for current file
 
 ### Planned Custom Context Providers
 - `#def:symbol` - Include symbol definition via LSP
 - `#ref:symbol` - Include all references to symbol via LSP
-- `#diagnostics` - Include LSP diagnostics for current file
 - `#diff` - Include current git diff
 - `#diff:path` - Include git diff for specific path
 - `#tree` - Include project file tree structure
@@ -111,8 +111,8 @@ This document outlines the implementation plan for adding context injection feat
 - [ ] Implement `@def:symbol` using `vim.lsp.buf.definition()`
 - [ ] Implement `@func:name` with symbol search and definition retrieval
 - [ ] Implement `@ref:symbol` using `vim.lsp.buf.references()`
-- [ ] Add `@diagnostics` for current file/buffer diagnostics
-- [ ] Support `@diagnostics:path` for specific file diagnostics
+- [x] Add `@diagnostics` for current file/buffer diagnostics
+- [x] Support `@diagnostics:path` for specific file diagnostics
 - [ ] Handle cases where LSP is not available or symbol not found
 - [ ] Format LSP responses into structured context
 
@@ -136,7 +136,7 @@ This document outlines the implementation plan for adding context injection feat
 **Tasks:**
 - [ ] Implement `@diff` using `git diff` command
 - [ ] Support `@diff:path` for specific file/directory diffs
-- [ ] Add `@tree` using `git ls-files` or `find` with .gitignore respect
+- [ ] Add `@tree` using `git ls-files`
 - [ ] Handle non-git repositories gracefully
 - [ ] Support git worktree scenarios
 - [ ] Format git output for LLM consumption
@@ -322,20 +322,20 @@ Debug info shown to user (filtered from LLM):
 
 **Completed:**
 - ✅ Step 1: Core Context Parser Infrastructure
-  - All three reference types parsing: `@file`, `@!`cmd``, `#provider`
-  - Path resolution with git root fallback
-  - Custom provider registry system
-  - Debug info display and filtering
-  - XML-formatted context injection
-  - Error handling with notifications
+- ✅ Step 2: File/Directory enhancements
+
+- All three reference types parsing: `@file`, `@!`cmd``, `#provider`
+- Path resolution with git root fallback
+- Custom provider registry system
+- Debug info display and filtering
+- XML-formatted context injection
+- Error handling with notifications
 
 **Next Actions:**
-1. Complete Step 2: Add file size limits and directory traversal
 2. Begin Step 3: LSP Integration (most requested feature)
 3. Begin Step 4: Git Integration (useful for code reviews)
 
 **Implementation Order (Revised):**
-1. File/Directory enhancements (size limits, `@dir/`)
 2. LSP integration (`@def:`, `@ref:`, `@diagnostics`)
 3. Git integration (`@diff`, `@tree`)
 4. Harpoon integration (after documentation provided)
