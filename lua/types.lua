@@ -9,7 +9,18 @@
 --- @field default_model string?
 --- @field available_models string[]?
 --- @field enable_helicone boolean?
---- @field context_providers table<string, fun(ref: CustomRef): string?, string?>?
+--- @field context_providers table<string, ContextProvider?>?
+
+--- @class Config
+--- @field base_url string
+--- @field api_key_name string
+--- @field edit_prompt string
+--- @field help_prompt string
+--- @field default_model string
+--- @field current_model string?
+--- @field available_models string[]
+--- @field enable_helicone boolean
+--- @field context_providers table<string, ContextProvider>
 
 --- @class Ref
 --- @field type "file" | "shell" | "ctx_provider" | "error"
@@ -34,6 +45,10 @@
 --- @field end_line? number
 
 --- @alias ContextRef PathRef | ShellRef | CustomRef | Ref
+
+--- @class ContextProvider
+--- @field description string
+--- @field handler fun(ref: CustomRef): string?, string?
 
 --- @class ResolvedRef
 --- @field ref ContextRef

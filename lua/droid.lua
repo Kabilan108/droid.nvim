@@ -34,8 +34,27 @@ local M = {}
 local util = {}
 M.util = util
 
--- state
-local config = {}
+--- @type Config
+local config = {
+  -- base_url = "https://openrouter.ai/api/v1",
+  base_url = "https://openrouter.helicone.ai/api/v1",
+  edit_prompt = prompts.edit_prompt,
+  help_prompt = prompts.help_prompt,
+  default_model = "openai/gpt-4.1",
+  available_models = {
+    "openai/gpt-4.1",
+    "openai/o4-mini-high",
+    "anthropic/claude-sonnet-4",
+    "anthropic/claude-3.5-sonnet-20240620",
+    "google/gemini-2.5-pro-preview",
+    "google/gemini-2.5-flash-preview-05-20:thinking",
+    "x-ai/grok-3-mini-beta",
+  },
+  api_key_name = "OPENROUTER_API_KEY",
+  enable_helicone = true,
+  context_providers = providers.builtin,
+}
+
 local active_job = nil
 local group = vim.api.nvim_create_augroup('Droid_AutoGroup', { clear = true })
 local droid_buffer_counter = 0
@@ -43,31 +62,10 @@ local droid_buffers = {} -- track active droid buffers
 
 -- >>>public api
 
-M.available_models = {
-  "openai/gpt-4.1",
-  "openai/o4-mini-high",
-  "anthropic/claude-sonnet-4",
-  "anthropic/claude-3.5-sonnet-20240620",
-  "google/gemini-2.5-pro-preview",
-  "google/gemini-2.5-flash-preview-05-20:thinking",
-  "x-ai/grok-3-mini-beta",
-}
-
 --- setup function to initialize the plugin
 --- @param opts Droid.Opts?
 function M.setup(opts)
-  local defaults = {
-    -- base_url = "https://openrouter.ai/api/v1",
-    base_url = "https://openrouter.helicone.ai/api/v1",
-    edit_prompt = prompts.edit_prompt,
-    help_prompt = prompts.help_prompt,
-    default_model = M.available_models[1],
-    available_models = M.available_models,
-    api_key_name = "OPENROUTER_API_KEY", -- must be provided
-    enable_helicone = true,
-  }
-
-  config = vim.tbl_deep_extend("force", defaults, opts or {})
+  config = vim.tbl_deep_extend("force", config, opts or {})
   if opts and opts.context_providers then
     config.context_providers = vim.tbl_extend("force", providers.builtin, opts.context_providers)
   else
@@ -660,7 +658,7 @@ function util.resolve_context_reference(ref)
 
   if ref.type == "ctx_provider" then
     local p = config.context_providers[ref.name]
-    if not p then
+    if not p or not p.handler then
       return { ref = ref, error = "unknown context provider: " .. ref.name }
     end
 
@@ -673,7 +671,7 @@ function util.resolve_context_reference(ref)
       ref.path = resolved_path
     end
 
-    local ok, out, err = pcall(p, ref)
+    local ok, out, err = pcall(p.handler, ref)
     if not ok or not out or err then
       return { ref = ref, error = "context provider failed: " .. err }
     end
@@ -725,6 +723,26 @@ function util.build_prompt(prompt)
     error = table.concat(error_l, "\n"),
     refs = refs
   }
+end
+
+--- build the system prompt for help mode
+--- @return string
+function util.build_help_system_prompt()
+  local lines = {}
+  for name, provider in pairs(config.context_providers) do
+    if provider.description then
+      table.insert(lines, string.format("- #%s: %s", name, provider.description))
+    end
+  end
+
+  table.sort(lines)
+  local provider_str = table.concat(lines, "\n")
+
+  if provider_str == "" then
+    return "no context providers available"
+  end
+
+  return string.format(prompts.help_prompt_template, provider_str)
 end
 
 ---@param pc PromptContext
@@ -960,17 +978,14 @@ function util.make_anthropic_spec_curl_args(mode, prompt)
 end
 
 --- creates curl arguments for openai-compatible api requests
---- @param mode "edit"|"help"
+--- @param system_prompt string
 --- @param messages Message[]
 --- @return string[] Array curl command arguments
-function util.make_openai_spec_curl_args(mode, messages)
+function util.make_openai_spec_curl_args(system_prompt, messages)
   local base_url = config.base_url .. "/chat/completions"
   local api_key = config.api_key_name and os.getenv(config.api_key_name) or ''
 
-  local convhist = {
-    { role = 'system', content = mode == "edit" and config.edit_prompt or config.help_prompt }
-  }
-
+  local convhist = { { role = 'system', content = system_prompt } }
   for _, msg in ipairs(messages) do
     table.insert(convhist, { role = msg.role, content = msg.content })
   end
@@ -1072,6 +1087,13 @@ function util.invoke_llm_and_stream_into_editor(mode)
   local processed_messages = {}
   local debug_info = ""
 
+  local system_prompt
+  if mode == "help" then
+    system_prompt = util.build_help_system_prompt()
+  else
+    system_prompt = config.edit_prompt
+  end
+
   if messages then
     for i, message in ipairs(messages) do
       local content = ""
@@ -1098,7 +1120,7 @@ function util.invoke_llm_and_stream_into_editor(mode)
     end
   end
 
-  local args = util.make_openai_spec_curl_args(mode, processed_messages)
+  local args = util.make_openai_spec_curl_args(system_prompt, processed_messages)
   local curr_event_state = nil
 
   -- track assistant markers and usage stats
