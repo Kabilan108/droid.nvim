@@ -58,4 +58,71 @@ M.builtin["diagnostics"] = {
   end
 }
 
+M.builtin["harpoon"] = {
+  description = "gets the content of files marked in harpoon. specify an index or get all.",
+  handler = function(ref)
+    -- Safely check if harpoon is available
+    local ok, harpoon = pcall(require, 'harpoon')
+    if not ok then
+      return nil, "harpoon plugin not installed or not available"
+    end
+
+    -- Get the harpoon list
+    local list = harpoon:list()
+    if not list or not list.items or #list.items == 0 then
+      return nil, "harpoon list is empty"
+    end
+
+    -- Check if specific index is requested
+    if ref.path and ref.path ~= "" then
+      local index = tonumber(ref.path)
+      if not index then
+        return nil, "invalid harpoon index: " .. ref.path
+      end
+
+      if index < 1 or index > #list.items then
+        return nil, string.format("harpoon index %d out of range (1-%d)", index, #list.items)
+      end
+
+      -- Get specific item
+      local item = list:get(index)
+      if not item or not item.value then
+        return nil, string.format("harpoon item at index %d is invalid", index)
+      end
+
+      -- Read file content
+      local file_path = item.value
+      local content = vim.fn.system(string.format("cat %s", vim.fn.shellescape(file_path)))
+      if vim.v.shell_error ~= 0 then
+        return nil, string.format("failed to read harpoon file: %s", file_path)
+      end
+
+      return string.format("--- HARPOON [%d]: %s ---\n%s", index, file_path, content), nil
+    else
+      -- Get all items
+      local result_lines = {}
+      for i, item in ipairs(list.items) do
+        if item and item.value then
+          local file_path = item.value
+          local content = vim.fn.system(string.format("cat %s", vim.fn.shellescape(file_path)))
+          if vim.v.shell_error == 0 then
+            table.insert(result_lines, string.format("--- HARPOON [%d]: %s ---", i, file_path))
+            table.insert(result_lines, content)
+            table.insert(result_lines, "") -- Empty line separator
+          else
+            table.insert(result_lines, string.format("--- HARPOON [%d]: %s (failed to read) ---", i, file_path))
+            table.insert(result_lines, "") -- Empty line separator
+          end
+        end
+      end
+
+      if #result_lines == 0 then
+        return nil, "no valid harpoon files found"
+      end
+
+      return table.concat(result_lines, "\n"), nil
+    end
+  end
+}
+
 return M
