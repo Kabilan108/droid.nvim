@@ -61,6 +61,7 @@ M.available_models = {
 --- @field default_model string?
 --- @field available_models string[]?
 --- @field enable_helicone boolean?
+--- @field context_providers table<string, fun(ref: CustomRef): string?, string?>?
 
 --- setup function to initialize the plugin
 --- @param opts Droid.Opts?
@@ -76,9 +77,14 @@ function M.setup(opts)
     available_models = M.available_models,
     api_key_name = "OPENROUTER_API_KEY", -- must be provided
     enable_helicone = true,
+    context_providers = M.builtin_providers,
   }
 
   config = vim.tbl_deep_extend("force", defaults, opts or {})
+  -- merge user context providers with builtins
+  if opts and opts.context_providers then
+    config.context_providers = vim.tbl_extend("force", M.builtin_providers, opts.context_providers)
+  end
 
   if not (type(config.api_key_name) == "string" and config.api_key_name ~= "") then
     error("api_key_name must be provided in droid.setup()")
@@ -273,14 +279,6 @@ function M.list_droid_buffers()
   return active_buffers
 end
 
---- checks if a buffer is a droid buffer
---- @param buf_id number? buffer id (defaults to current buffer)
---- @return boolean
-function M.is_droid_buffer(buf_id)
-  buf_id = buf_id or vim.api.nvim_get_current_buf()
-  return droid_buffers[buf_id] ~= nil
-end
-
 --- creates a telescope picker for droid chat buffers
 function M.pick_droid_buffer()
   if not config.api_key_name then
@@ -371,14 +369,62 @@ function M.pick_droid_buffer()
   }):find()
 end
 
---- registers a custom context provider
---- @param name string the provider name (used in @name:args syntax)
---- @param handler fun(args: CustomRef): string?, string?
-function M.register_context_provider(name, handler)
-  if type(name) ~= "string" or type(handler) ~= "function" then
-    error("register_context_provider requires string name and function handler")
+-- >>>context providers
+
+--- @type table<string, fun(ref: CustomRef): string?, string?>
+M.builtin_providers = {}
+
+--- @param ref CustomRef
+M.builtin_providers["diagnostics"] = function(ref)
+  local bufnr
+  local title
+
+  if ref.path then
+    bufnr = vim.fn.bufnr(ref.path, true) -- create if not found
+    if bufnr == -1 or not vim.api.nvim_buf_is_valid(bufnr) then
+      return nil, "could not load or find a valid buffer for " .. ref.path
+    end
+    title = string.format("diagnostics for %s:", ref.path)
+  else
+    bufnr = vim.api.nvim_get_current_buf()
+    title = string.format("diagnostics for buffer %d (%s):", bufnr, vim.api.nvim_buf_get_name(bufnr))
   end
-  context_providers[name] = handler
+
+  local diagnostics = vim.diagnostic.get(bufnr)
+
+  if not diagnostics or #diagnostics == 0 then
+    return "no diagnostics available", nil
+  end
+
+  if ref.start_line and ref.end_line then
+    if ref.start_line < 1 or ref.end_line < 1 then
+      return nil, "invalid line range"
+    end
+    diagnostics = vim.tbl_filter(function(d)
+      return (d.lnum + 1) >= ref.start_line and (d.lnum + 1) <= ref.end_line
+    end, diagnostics)
+  end
+
+  if #diagnostics == 0 then
+    return "no diagnostics found in the specified range", nil
+  end
+
+  local lines = { title }
+  local sevmap = { "error", "warn", "info", "hint" }
+
+  for _, d in ipairs(diagnostics) do
+    local sevstr = sevmap[d.severity] or "unknown"
+    table.insert(lines, string.format(
+      "- [%s] L%d:%d: %s (%s)",
+      sevstr:upper(),
+      d.lnum + 1, -- lnum is 0-indexed
+      d.col + 1,  -- col is 0-indexed
+      d.message:gsub("\n", " "),
+      d.source or "lsp"
+    ))
+  end
+
+  return table.concat(lines, "\n"), nil
 end
 
 -- >>>utilities
@@ -443,21 +489,34 @@ end
 
 --- utility function to resolve file paths relative to git root or cwd
 --- @param path string the file path to resolve
+--- @param allow_dir boolean? whether to allow directory paths (default: false)
 --- @return string? resolved absolute path
 --- @return string? error message if resolution fails
-function util.resolve_file_path(path)
+function util.resolve_file_path(path, allow_dir)
+  allow_dir = allow_dir or false
+
+  local function is_valid_path(p)
+    if allow_dir then
+      return vim.fn.filereadable(p) == 1 or vim.fn.isdirectory(p) == 1
+    else
+      return vim.fn.filereadable(p) == 1
+    end
+  end
+
+  local error_msg = allow_dir and "path not found: " or "file not found: "
+
   -- handle absolute paths
   if path:match("^/") then
-    if vim.fn.filereadable(path) == 1 then
+    if is_valid_path(path) then
       return path, nil
     else
-      return nil, "file not found: " .. path
+      return nil, error_msg .. path
     end
   end
 
   -- try relative to current working directory first
   local cwd_path = vim.fn.getcwd() .. "/" .. path
-  if vim.fn.filereadable(cwd_path) == 1 then
+  if is_valid_path(cwd_path) then
     return cwd_path, nil
   end
 
@@ -465,12 +524,12 @@ function util.resolve_file_path(path)
   local git_root = vim.fn.system("git rev-parse --show-toplevel 2>/dev/null"):gsub("\n$", "")
   if vim.v.shell_error == 0 and git_root ~= "" then
     local git_path = git_root .. "/" .. path
-    if vim.fn.filereadable(git_path) == 1 then
+    if is_valid_path(git_path) then
       return git_path, nil
     end
   end
 
-  return nil, "file not found: " .. path
+  return nil, error_msg .. path
 end
 
 -- >>>context injection
@@ -703,6 +762,16 @@ function util.resolve_context_reference(ref)
     if not p then
       return { ref = ref, error = "unknown context provider: " .. ref.name }
     end
+
+    -- if path is provided, only call handler if file (or dir) exists
+    if ref.path then
+      local resolved_path, err = util.resolve_file_path(ref.path, true)
+      if not resolved_path or err then
+        return { ref = ref, error = err }
+      end
+      ref.path = resolved_path
+    end
+
     local ok, out, err = pcall(p, ref)
     if not ok or not out or err then
       return { ref = ref, error = "context provider failed: " .. err }
