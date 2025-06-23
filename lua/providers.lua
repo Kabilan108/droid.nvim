@@ -92,10 +92,11 @@ M.builtin["harpoon"] = {
 
       -- Read file content
       local file_path = item.value
-      local content = vim.fn.system(string.format("cat %s", vim.fn.shellescape(file_path)))
-      if vim.v.shell_error ~= 0 then
+      local lines, err = vim.fn.readfile(file_path)
+      if err or not lines then
         return nil, string.format("failed to read harpoon file: %s", file_path)
       end
+      local content = table.concat(lines, "\n")
 
       return string.format("--- HARPOON [%d]: %s ---\n%s", index, file_path, content), nil
     else
@@ -104,8 +105,9 @@ M.builtin["harpoon"] = {
       for i, item in ipairs(list.items) do
         if item and item.value then
           local file_path = item.value
-          local content = vim.fn.system(string.format("cat %s", vim.fn.shellescape(file_path)))
-          if vim.v.shell_error == 0 then
+          local lines, err = vim.fn.readfile(file_path)
+          if not err and lines then
+            local content = table.concat(lines, "\n")
             table.insert(result_lines, string.format("--- HARPOON [%d]: %s ---", i, file_path))
             table.insert(result_lines, content)
             table.insert(result_lines, "") -- Empty line separator
