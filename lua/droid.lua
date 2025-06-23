@@ -9,6 +9,9 @@ local action_state = require "telescope.actions.state"
 local previewers = require "telescope.previewers"
 local mini_notify = require('mini.notify')
 
+local providers = require("providers")
+local prompts = require("prompts")
+
 mini_notify.setup()
 local notify = mini_notify.make_notify({
   ERROR = { duration = 5000 },
@@ -38,9 +41,6 @@ local group = vim.api.nvim_create_augroup('Droid_AutoGroup', { clear = true })
 local droid_buffer_counter = 0
 local droid_buffers = {} -- track active droid buffers
 
---- @type table<string, fun(ref: CustomRef): string?, string?>
-local context_providers = {}
-
 -- >>>public api
 
 M.available_models = {
@@ -53,37 +53,25 @@ M.available_models = {
   "x-ai/grok-3-mini-beta",
 }
 
---- @class Droid.Opts
---- @field base_url string?
---- @field api_key_name string
---- @field edit_prompt string?
---- @field help_prompt string?
---- @field default_model string?
---- @field available_models string[]?
---- @field enable_helicone boolean?
---- @field context_providers table<string, fun(ref: CustomRef): string?, string?>?
-
 --- setup function to initialize the plugin
 --- @param opts Droid.Opts?
 function M.setup(opts)
   local defaults = {
     -- base_url = "https://openrouter.ai/api/v1",
     base_url = "https://openrouter.helicone.ai/api/v1",
-    edit_prompt =
-    "You should replace the code that you are sent, only following the comments. Do not talk at all. Only output valid code. Do not provide any backticks that surround the code. Never ever output backticks like this ```. Any comment that is asking you for something should be removed after you satisfy them. Other comments should left alone. Do not output backticks",
-    help_prompt =
-    "you are a helpful assistant. you're working with me in neovim. i'll send you contents of the buffer(s) im working in along with notes, questions or comments. you are very curt, yet helpful and a bit sarcastic.",
+    edit_prompt = prompts.edit_prompt,
+    help_prompt = prompts.help_prompt,
     default_model = M.available_models[1],
     available_models = M.available_models,
     api_key_name = "OPENROUTER_API_KEY", -- must be provided
     enable_helicone = true,
-    context_providers = M.builtin_providers,
   }
 
   config = vim.tbl_deep_extend("force", defaults, opts or {})
-  -- merge user context providers with builtins
   if opts and opts.context_providers then
-    config.context_providers = vim.tbl_extend("force", M.builtin_providers, opts.context_providers)
+    config.context_providers = vim.tbl_extend("force", providers.builtin, opts.context_providers)
+  else
+    config.context_providers = providers.builtin
   end
 
   if not (type(config.api_key_name) == "string" and config.api_key_name ~= "") then
@@ -102,19 +90,6 @@ end
 --- @return string
 function M.get_current_model()
   return config.current_model or config.default_model
-end
-
----@param model string
-function M.set_current_model(model)
-  if vim.tbl_contains(config.available_models, model) then
-    config.current_model = model
-    if not util.save_persisted_model(model) then
-      notify("droid: model set but failed to persist", vim.log.levels.WARN)
-    end
-    notify("droid: using " .. model, vim.log.levels.INFO)
-  else
-    notify("droid: invalid model " .. model, vim.log.levels.ERROR)
-  end
 end
 
 function M.cancel_completion()
@@ -179,7 +154,7 @@ function M.select_model()
         actions.close(prompt_bufnr)
         local selection = action_state.get_selected_entry()
         if selection and selection.value then
-          M.set_current_model(selection.value.model)
+          util.set_current_model(selection.value.model)
         end
       end)
       return true
@@ -369,65 +344,20 @@ function M.pick_droid_buffer()
   }):find()
 end
 
--- >>>context providers
-
---- @type table<string, fun(ref: CustomRef): string?, string?>
-M.builtin_providers = {}
-
---- @param ref CustomRef
-M.builtin_providers["diagnostics"] = function(ref)
-  local bufnr
-  local title
-
-  if ref.path then
-    bufnr = vim.fn.bufnr(ref.path, true) -- create if not found
-    if bufnr == -1 or not vim.api.nvim_buf_is_valid(bufnr) then
-      return nil, "could not load or find a valid buffer for " .. ref.path
-    end
-    title = string.format("diagnostics for %s:", ref.path)
-  else
-    bufnr = vim.api.nvim_get_current_buf()
-    title = string.format("diagnostics for buffer %d (%s):", bufnr, vim.api.nvim_buf_get_name(bufnr))
-  end
-
-  local diagnostics = vim.diagnostic.get(bufnr)
-
-  if not diagnostics or #diagnostics == 0 then
-    return "no diagnostics available", nil
-  end
-
-  if ref.start_line and ref.end_line then
-    if ref.start_line < 1 or ref.end_line < 1 then
-      return nil, "invalid line range"
-    end
-    diagnostics = vim.tbl_filter(function(d)
-      return (d.lnum + 1) >= ref.start_line and (d.lnum + 1) <= ref.end_line
-    end, diagnostics)
-  end
-
-  if #diagnostics == 0 then
-    return "no diagnostics found in the specified range", nil
-  end
-
-  local lines = { title }
-  local sevmap = { "error", "warn", "info", "hint" }
-
-  for _, d in ipairs(diagnostics) do
-    local sevstr = sevmap[d.severity] or "unknown"
-    table.insert(lines, string.format(
-      "- [%s] L%d:%d: %s (%s)",
-      sevstr:upper(),
-      d.lnum + 1, -- lnum is 0-indexed
-      d.col + 1,  -- col is 0-indexed
-      d.message:gsub("\n", " "),
-      d.source or "lsp"
-    ))
-  end
-
-  return table.concat(lines, "\n"), nil
-end
-
 -- >>>utilities
+
+---@param model string
+function util.set_current_model(model)
+  if vim.tbl_contains(config.available_models, model) then
+    config.current_model = model
+    if not util.save_persisted_model(model) then
+      notify("droid: model set but failed to persist", vim.log.levels.WARN)
+    end
+    notify("droid: using " .. model, vim.log.levels.INFO)
+  else
+    notify("droid: invalid model " .. model, vim.log.levels.ERROR)
+  end
+end
 
 --- gets the path to the model persistence file
 --- @return string
@@ -534,30 +464,6 @@ end
 
 -- >>>context injection
 
---- @class Ref
---- @field type "file" | "shell" | "ctx_provider" | "error"
---- @field error? string
---- @field raw string
-
---- @class PathRef : Ref
---- @field type "file"
---- @field path string
---- @field start_line? number
---- @field end_line? number
-
---- @class ShellRef : Ref
---- @field type "shell"
---- @field command string
-
---- @class CustomRef : Ref
---- @field type "ctx_provider"
---- @field name string
---- @field path? string
---- @field start_line? number
---- @field end_line? number
-
---- @alias ContextRef PathRef | ShellRef | CustomRef | Ref
-
 --- @param text string
 --- @return CustomRef[]
 local function parse_custom_refs(text)
@@ -573,7 +479,7 @@ local function parse_custom_refs(text)
     end
 
     if refname then
-      if context_providers[refname] then
+      if config.context_providers[refname] then
         local parsed_ref = {
           type = "ctx_provider",
           name = refname,
@@ -736,11 +642,6 @@ function util.read_file(path, start_line, end_line)
   return content, nil
 end
 
---- @class ResolvedRef
---- @field ref ContextRef
---- @field content? string
---- @field error? string
-
 --- resolves a single context reference and returns formatted content
 --- @param ref ContextRef
 --- @return ResolvedRef resolved
@@ -758,7 +659,7 @@ function util.resolve_context_reference(ref)
   end
 
   if ref.type == "ctx_provider" then
-    local p = context_providers[ref.name]
+    local p = config.context_providers[ref.name]
     if not p then
       return { ref = ref, error = "unknown context provider: " .. ref.name }
     end
@@ -794,13 +695,6 @@ function util.resolve_context_reference(ref)
 
   return { ref = ref, error = "unknown reference type: " .. ref.type }
 end
-
---- @class PromptContext
---- @field prompt string
---- @field context string
---- @field debug string
---- @field error string?
---- @field refs ContextRef[
 
 --- @param prompt string
 --- @return PromptContext
@@ -843,11 +737,6 @@ local function format_prompt_for_api(pc)
 end
 
 -- >>>completions
-
---- @class Message
---- @field role "user"|"assistant"
---- @field content string
---- @field model string? only for assistant messages
 
 --- writes a string at the current cursor position in the buffer
 --- @param str string
