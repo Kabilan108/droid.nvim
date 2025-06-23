@@ -58,4 +58,58 @@ M.builtin["diagnostics"] = {
   end
 }
 
+M.builtin["diff"] = {
+  description = "gets the output of `git diff` for the current repository, optionally scoped to a path.",
+  handler = function(ref)
+    -- Check if we're in a git repository
+    local git_check = vim.fn.system("git rev-parse --is-inside-work-tree 2>/dev/null")
+    if vim.v.shell_error ~= 0 then
+      return nil, "not in a git repository"
+    end
+
+    -- Construct git diff command
+    local cmd = "git diff"
+    if ref.path then
+      cmd = cmd .. " " .. vim.fn.shellescape(ref.path)
+    end
+
+    -- Execute git diff
+    local output = vim.fn.system(cmd)
+    if vim.v.shell_error ~= 0 then
+      return nil, "git diff command failed"
+    end
+
+    -- Handle empty diff
+    if output == "" or output:match("^%s*$") then
+      return "no changes", nil
+    end
+
+    return output, nil
+  end
+}
+
+M.builtin["tree"] = {
+  description = "gets the project file tree from `git ls-files`.",
+  handler = function(ref)
+    -- Check if we're in a git repository
+    local git_check = vim.fn.system("git rev-parse --is-inside-work-tree 2>/dev/null")
+    if vim.v.shell_error ~= 0 then
+      return nil, "not in a git repository"
+    end
+
+    -- Execute git ls-files
+    local output = vim.fn.system("git ls-files")
+    if vim.v.shell_error ~= 0 then
+      return nil, "git ls-files command failed"
+    end
+
+    -- Handle empty repository
+    if output == "" or output:match("^%s*$") then
+      return "no files tracked by git", nil
+    end
+
+    return output, nil
+  end
+}
+
 return M
