@@ -3,6 +3,12 @@
 
 local M = {}
 
+--- @return boolean
+local function is_in_git_repo()
+  vim.fn.system("git rev-parse --is-inside-work-tree 2>/dev/null")
+  return vim.v.shell_error == 0
+end
+
 --- @type table<string, ContextProvider>
 M.builtin = {}
 
@@ -62,8 +68,7 @@ M.builtin["diff"] = {
   description = "gets the output of `git diff` for the current repository, optionally scoped to a path.",
   handler = function(ref)
     -- Check if we're in a git repository
-    local git_check = vim.fn.system("git rev-parse --is-inside-work-tree 2>/dev/null")
-    if vim.v.shell_error ~= 0 then
+    if not is_in_git_repo() then
       return nil, "not in a git repository"
     end
 
@@ -80,7 +85,7 @@ M.builtin["diff"] = {
     end
 
     -- Handle empty diff
-    if output == "" or output:match("^%s*$") then
+    if output:match("^%s*$") then
       return "no changes", nil
     end
 
@@ -92,8 +97,7 @@ M.builtin["tree"] = {
   description = "gets the project file tree from `git ls-files`.",
   handler = function(ref)
     -- Check if we're in a git repository
-    local git_check = vim.fn.system("git rev-parse --is-inside-work-tree 2>/dev/null")
-    if vim.v.shell_error ~= 0 then
+    if not is_in_git_repo() then
       return nil, "not in a git repository"
     end
 
